@@ -26,6 +26,9 @@
 -export([start/1]).
 -export([init/0]).
 
+-define(MESSAGES_CT, [amoc, counters, messages_sent]).
+-define(MESSAGE_TTD_CT, [amoc, times, message_ttd]).
+
 -type binjid() :: binary().
 
 -spec init() -> ok.
@@ -37,16 +40,16 @@ init() ->
 
 -spec user_spec(binary(), binary(), binary()) -> escalus_users:user_spec().
 user_spec(ProfileId, Password, Res) ->
+    Server = pick_server(),
     [ {username, ProfileId},
       {server, ?HOST},
-      {host, pick_server()},
       {password, Password},
       {carbons, false},
       {stream_management, false},
       {resource, Res},
       {received_stanza_handlers, [fun amoc_xmpp_handlers:measure_ttd/3]},
       {sent_stanza_handlers, [fun amoc_xmpp_handlers:measure_sent_messages/2]}
-    ].
+    ] ++ Server.
 
 -spec make_user(amoc_scenario:user_id(), binary()) -> escalus_users:user_spec().
 make_user(Id, R) ->
@@ -55,12 +58,31 @@ make_user(Id, R) ->
     Password = <<"password_", BinId/binary>>,
     user_spec(ProfileId, Password, R).
 
+-spec socket_opts() -> [gen_tcp:option()].
+socket_opts() ->
+    [binary,
+     {reuseaddr, false},
+     {nodelay, true}].
+
 -spec start(amoc_scenario:user_id()) -> any().
 start(MyId) ->
-    Cfg = make_user(MyId, <<"res1">>),
-    {ok, Client, _} = amoc_xmpp:connect_or_exit(Cfg),
+    Cfg1 = make_user(MyId, <<"res1">>),
+    Cfg2 = [{socket_opts, socket_opts()} | Cfg1],
 
     IsChecker = MyId rem ?CHECKER_SESSIONS_INDICATOR == 0,
+
+    {ConnectionTime, ConnectionResult} = timer:tc(escalus_connection, start, [Cfg2]),
+    Client = case ConnectionResult of
+        {ok, ConnectedClient, _} ->
+            amoc_metrics:update_counter(connections),
+            amoc_metrics:update_time(connection, ConnectionTime),
+            ConnectedClient;
+        Error ->
+            amoc_metrics:update_counter(connection_failures),
+            lager:error("Could not connect user=~p, reason=~p", [Cfg2, Error]),
+            exit(connection_failed)
+    end,
+
     do(IsChecker, MyId, Client),
 
     timer:sleep(?SLEEP_TIME_AFTER_SCENARIO),
@@ -108,7 +130,7 @@ send_messages_to_neighbors(Client, TargetIds, SleepTime) ->
 -spec send_message(escalus:client(), binjid(), timeout()) -> ok.
 send_message(Client, ToId, SleepTime) ->
     MsgIn = make_message(ToId),
-    TimeStamp = integer_to_binary(usec:from_now(os:timestamp())),
+    TimeStamp = integer_to_binary(os:system_time(micro_seconds)),
     escalus_connection:send(Client, escalus_stanza:setattr(MsgIn, <<"timestamp">>, TimeStamp)),
     timer:sleep(SleepTime).
 
@@ -125,9 +147,18 @@ make_jid(Id) ->
     Host = ?HOST,
     << ProfileId/binary, "@", Host/binary >>.
 
--spec pick_server() -> binary().
+-spec pick_server() -> [proplists:property()].
 pick_server() ->
     Servers = amoc_config:get(xmpp_servers),
-    S = size(Servers),
+    verify(Servers),
+    S = length(Servers),
     N = erlang:phash2(self(), S) + 1,
-    element(N, Servers).
+    lists:nth(N, Servers).
+
+verify(Servers) ->
+    lists:foreach(
+      fun(Proplist) ->
+              true = proplists:is_defined(host, Proplist)
+      end,
+      Servers
+     ).
